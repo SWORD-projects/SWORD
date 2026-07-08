@@ -548,14 +548,19 @@ class StructureEntry:
     @classmethod
     def from_txt(cls, raw_txt, *, code = None, meta=None, symprec=1e-2, angle_tolerance=5, parser_occ_tolerance: float = 1.05, source: str = 'None', conventional_struct: bool = True, refine_struct: bool = False):
         #construct a ICSD-style symmetrized CIF_txt from raw CIF or POSCAR
-        try: # find_symprec need to be  modified to adjust POSCAR
-            symprec, is_merge, struct, sga = find_symprec(raw_txt, n=2, symprec=symprec, angle_tolerance=5, parser_occ_tolerance=parser_occ_tolerance)
-        except Exception as e:
-            warnings.warn(
-                f"[StructureEntry.from_txt] find_symprec failed: falling back to use default symprec."
-                f"symprec={symprec}, angle_tol={angle_tolerance}. "
-                f"Error: {e}")
-            symprec, is_merge, struct, sga = symprec, False, None, None
+        if any(k in raw_txt for k in ("_atom_site", "_cell_length", "data_")):
+            try:
+                symprec, is_merge, struct, sga = find_symprec(raw_txt, n=2, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance)
+            except Exception as e:
+                warnings.warn(
+                    f"[StructureEntry.from_txt] find_symprec failed: falling back to use default symprec."
+                    f"symprec={symprec}, angle_tol={angle_tolerance}. "
+                    f"Error: {e}")
+                symprec, is_merge, struct, sga = symprec, False, None, None
+        else:
+            struct = Structure.from_str(raw_txt, fmt="poscar")
+            sga = SpacegroupAnalyzer(struct, symprec=symprec, angle_tolerance=angle_tolerance)
+            is_merge = False
         sym_txt = str(_SymmetrizedCifWriter(raw_txt, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance, struct=struct, spg_analyzer=sga, conventional_struct=conventional_struct, refine_struct=refine_struct)._cf)
         # Check completeness of input to determine whether to parse raw or symmetrized file
         #use_sym = not is_symmetrized_CIF(raw_txt, sym_txt)

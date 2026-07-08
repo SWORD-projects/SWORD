@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import logging
+import math
 import re
 import traceback
 from itertools import combinations
@@ -12,6 +14,7 @@ from monty.json import MSONable
 from pymatgen.core import Structure
 from pymatgen.core.periodic_table import DummySpecie
 from pymatgen.io.cif import CifParser
+from pymatgen.symmetry.groups import SpaceGroup
 
 from .label import get_sword_label
 from .vacancy import find_vacancy_ordered
@@ -117,6 +120,46 @@ class SWORDFamilyMatcher(MSONable):
                 new_species = {el: occ / total_occ for el, occ in site.species.items()}
                 structure[i] = new_species
 
+    @staticmethod
+    def _estimate_mask_dom(structure: Structure, mask: Sequence[str]) -> dict[str, Any] | None:
+        amounts = {str(el): 0.0 for el in mask}
+        for site in structure:
+            for specie, occ in site.species.items():
+                symbol = getattr(specie, "symbol", str(specie))
+                if symbol in amounts:
+                    amounts[symbol] += float(occ)
+
+        total = sum(amounts.values())
+        if total <= 0:
+            return None
+
+        occ_by_element = {
+            element: amount / total
+            for element, amount in amounts.items()
+            if amount > 0
+        }
+        if len(occ_by_element) < 2:
+            return None
+
+        occs = list(occ_by_element.values())
+        site_mixing = -sum(p * math.log(p) for p in occs) / math.log(len(occs))
+
+        kmin = min(occ_by_element, key=occ_by_element.get)
+        kmax = max(occ_by_element, key=occ_by_element.get)
+        a, b = sorted((kmin, kmax))
+        xa = occ_by_element[a]
+        xb = occ_by_element[b]
+        delta = 1 if xa == xb else (xa - xb) / abs(xa - xb)
+
+        items = sorted(occ_by_element.items())
+        return {
+            "dom_site_elements": [element for element, _ in items],
+            "dom_site_occupancies": [round(occ, 6) for _, occ in items],
+            "dom_dominant_element": max(items, key=lambda item: (item[1], item[0]))[0],
+            "degree_of_mixing": round(delta * site_mixing, 4),
+            "dom_source": "family_matcher",
+        }
+
     def get_sword_dic(self, child_data: Union[str, Structure], child_label: str | None = None) -> dict[str, Any]:
         """Return the child SWORD label and possible disorder-parent labels."""
         try:
@@ -142,6 +185,7 @@ class SWORDFamilyMatcher(MSONable):
                     structures_to_process.append((child_filled, None))
 
             all_parent_labels = set()
+            parent_label_info = {}
 
             for struct_target, target_label in structures_to_process:
                 if target_label is None:
@@ -186,6 +230,9 @@ class SWORDFamilyMatcher(MSONable):
                         mix = "+".join(sorted(mask))
                         fixed_label = self._fix_parent_label(raw_label, mix)
                         all_parent_labels.add(fixed_label)
+                        dom_info = self._estimate_mask_dom(struct_target, mask)
+                        if dom_info is not None:
+                            parent_label_info[fixed_label] = dom_info
                     
                     except Exception as e:
                         all_parent_labels.add(f"ERROR_IN_MASK_{'+'.join(mask)}: {str(e)}")
@@ -193,6 +240,7 @@ class SWORDFamilyMatcher(MSONable):
             return {
                 "child_label": child_label,
                 "parent_labels": list(all_parent_labels),
+                "parent_label_info": parent_label_info,
                 "status": "success"
             }
 
@@ -200,6 +248,7 @@ class SWORDFamilyMatcher(MSONable):
             return {
                 "child_label": "ERROR",
                 "parent_labels": [],
+                "parent_label_info": {},
                 "status": "failed",
                 "error_msg": str(main_e),
                 "traceback": traceback.format_exc()
@@ -212,6 +261,130 @@ class SWORDFamilyMatcher(MSONable):
         if child_label:
             labels.add(child_label)
         return labels
+
+    @staticmethod
+    def _parent_label_info_pool(family_dic: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        info = family_dic.get("parent_label_info")
+        return info if isinstance(info, dict) else {}
+
+    @staticmethod
+    def _sg_from_label(label: str | None) -> int | None:
+        if not label:
+            return None
+        for token in str(label).split("_"):
+            if token.isdigit():
+                return int(token)
+        return None
+
+    @classmethod
+    def _sg_relation(cls, query_label: str | None, ref_label: str | None) -> str:
+        query_sg = cls._sg_from_label(query_label)
+        ref_sg = cls._sg_from_label(ref_label)
+        if query_sg is None or ref_sg is None:
+            return "unrelated"
+        if query_sg == ref_sg:
+            return "identical"
+        try:
+            query_group = SpaceGroup.from_int_number(query_sg)
+            ref_group = SpaceGroup.from_int_number(ref_sg)
+            if query_group.is_subgroup(ref_group):
+                return "reachable"
+            if ref_group.is_subgroup(query_group):
+                return "reverse"
+        except Exception:
+            return "unrelated"
+        return "unrelated"
+
+    @staticmethod
+    def _as_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                parsed = ast.literal_eval(value)
+            except Exception:
+                return [value]
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, tuple):
+                return list(parsed)
+            return [parsed]
+        try:
+            if pd.isna(value):
+                return []
+        except Exception:
+            pass
+        return [value]
+
+    @classmethod
+    def _dom_point(
+        cls,
+        *,
+        elements: Any,
+        occupancies: Any,
+        dominant_element: Any,
+        degree_of_mixing: Any,
+    ) -> tuple[set[str], str, dict[str, float], float] | None:
+        elems = [str(element) for element in cls._as_list(elements)]
+        occs = cls._as_list(occupancies)
+        if not elems or not occs or dominant_element is None:
+            return None
+        try:
+            dom = float(degree_of_mixing)
+        except Exception:
+            return None
+
+        dominant = str(dominant_element)
+        try:
+            occ_by_element = {
+                element: float(occ)
+                for element, occ in zip(elems, occs)
+            }
+        except Exception:
+            return None
+        if dominant not in occ_by_element:
+            return None
+        return set(elems), dominant, occ_by_element, dom
+
+    @classmethod
+    def _dom_distance(
+        cls,
+        query_info: dict[str, Any] | None,
+        *,
+        ref_elements: Any,
+        ref_occupancies: Any,
+        ref_dominant_element: Any,
+        ref_degree_of_mixing: Any,
+    ) -> float | None:
+        if not query_info:
+            return None
+        query_point = cls._dom_point(
+            elements=query_info.get("dom_site_elements"),
+            occupancies=query_info.get("dom_site_occupancies"),
+            dominant_element=query_info.get("dom_dominant_element"),
+            degree_of_mixing=query_info.get("degree_of_mixing"),
+        )
+        ref_point = cls._dom_point(
+            elements=ref_elements,
+            occupancies=ref_occupancies,
+            dominant_element=ref_dominant_element,
+            degree_of_mixing=ref_degree_of_mixing,
+        )
+        if query_point is None or ref_point is None:
+            return None
+
+        query_elements, query_dominant, query_occ, query_dom = query_point
+        ref_elements_set, _, ref_occ, ref_dom = ref_point
+        if query_elements != ref_elements_set or query_dominant not in ref_occ:
+            return None
+
+        query_x = query_occ[query_dominant]
+        ref_x = ref_occ[query_dominant]
+        return round(((query_x - ref_x) ** 2 + (query_dom - ref_dom) ** 2) ** 0.5, 6)
 
     def fit(
         self,
@@ -290,6 +463,7 @@ class SWORDFamilyMatcher(MSONable):
         ref_family_col: str = "SWORD_family_dic",
         query_family_cols: tuple[str, ...] = ("SWORD_family_dic", "SWORD_family_dic_vac"),
         id_col: str | None = None,
+        dom_distance_tol: float = 0.10,
     ) -> dict[str, Any]:
         """Match one query structure or query row against a reference table."""
         all_query_dicts = self._query_family_dicts(query, query_family_cols)
@@ -309,6 +483,12 @@ class SWORDFamilyMatcher(MSONable):
                 "matched_disordered_labels": [],
                 "matched_disordered_ids": [],
                 "matched_source_by_id": {},
+                "matched_label_by_id": {},
+                "matching_mode_by_id": {},
+                "sg_relation_by_id": {},
+                "dom_distance_by_id": {},
+                "dom_match_by_id": {},
+                "dom_distance_tol": dom_distance_tol,
                 "status": "failed",
                 "error_msg": first_query_dict.get(
                     "error_msg",
@@ -329,18 +509,37 @@ class SWORDFamilyMatcher(MSONable):
             source: self._label_pool(family_dic)
             for source, family_dic in query_dicts
         }
+        query_parent_info = {
+            label: info
+            for _, family_dic in query_dicts
+            for label, info in self._parent_label_info_pool(family_dic).items()
+        }
 
         matched_ordered_labels = set()
         matched_ordered_ids = set()
         matched_disordered_labels = set()
         matched_disordered_ids = set()
         matched_source_by_id = {}
+        matched_label_by_id = {}
+        matching_mode_by_id = {}
+        sg_relation_by_id = {}
+        dom_distance_by_id = {}
+        dom_match_by_id = {}
 
         ref_family_col = self._default_ref_family_col(ref_df, ref_family_col)
         id_col = id_col if id_col is not None else self._default_id_col(ref_df)
         ref_ids = ref_df[id_col].values if id_col is not None else ref_df.index.values
+        ref_dom_columns = {
+            col: ref_df[col].values if col in ref_df.columns else [None] * len(ref_df)
+            for col in (
+                "degree_of_mixing",
+                "dom_site_elements",
+                "dom_site_occupancies",
+                "dom_dominant_element",
+            )
+        }
 
-        for ref_dict, ref_id in zip(ref_df[ref_family_col].values, ref_ids):
+        for idx, (ref_dict, ref_id) in enumerate(zip(ref_df[ref_family_col].values, ref_ids)):
             if not isinstance(ref_dict, dict) or ref_dict.get("status") != "success":
                 continue
                 
@@ -356,17 +555,52 @@ class SWORDFamilyMatcher(MSONable):
             ]
 
             if matched_sources:
+                matched_labels = sorted(
+                    {
+                        label
+                        for source in matched_sources
+                        for label in query_label_pools[source] & ref_all_labels
+                    }
+                )
+                matching_mode = (
+                    "direct"
+                    if any(ref_child_label in query_label_pools[source] for source in matched_sources)
+                    else "indirect"
+                )
+                matched_label = ref_child_label if matching_mode == "direct" else matched_labels[0]
+
                 if "+" in ref_child_label:
                     matched_disordered_labels.add(ref_child_label)
                     if pd.notna(ref_id):
                         matched_disordered_ids.add(ref_id)
                         matched_source_by_id[ref_id] = sorted(matched_sources)
                 else:
-                    if ref_child_label not in query_child_labels:
-                        matched_ordered_labels.add(ref_child_label)
-                        if pd.notna(ref_id):
-                            matched_ordered_ids.add(ref_id)
-                            matched_source_by_id[ref_id] = sorted(matched_sources)
+                    matched_ordered_labels.add(ref_child_label)
+                    if pd.notna(ref_id):
+                        matched_ordered_ids.add(ref_id)
+                        matched_source_by_id[ref_id] = sorted(matched_sources)
+
+                if pd.notna(ref_id):
+                    matched_label_by_id[ref_id] = matched_label
+                    matching_mode_by_id[ref_id] = matching_mode
+                    sg_relation_by_id[ref_id] = self._sg_relation(query_child_labels[0], ref_child_label)
+                    dom_distance = None
+                    if matching_mode == "direct" and "+" in ref_child_label:
+                        dom_distance = self._dom_distance(
+                            query_parent_info.get(ref_child_label),
+                            ref_elements=ref_dom_columns["dom_site_elements"][idx],
+                            ref_occupancies=ref_dom_columns["dom_site_occupancies"][idx],
+                            ref_dominant_element=ref_dom_columns["dom_dominant_element"][idx],
+                            ref_degree_of_mixing=ref_dom_columns["degree_of_mixing"][idx],
+                        )
+                    dom_distance_by_id[ref_id] = dom_distance
+                    dom_match_by_id[ref_id] = (
+                        "within_tol"
+                        if dom_distance is not None and dom_distance <= dom_distance_tol
+                        else "outside_tol"
+                        if dom_distance is not None
+                        else "not_comparable"
+                    )
 
         return {
             "child_label": query_child_labels[0],
@@ -376,6 +610,12 @@ class SWORDFamilyMatcher(MSONable):
             "matched_disordered_labels": list(matched_disordered_labels),
             "matched_disordered_ids": list(matched_disordered_ids),
             "matched_source_by_id": matched_source_by_id,
+            "matched_label_by_id": matched_label_by_id,
+            "matching_mode_by_id": matching_mode_by_id,
+            "sg_relation_by_id": sg_relation_by_id,
+            "dom_distance_by_id": dom_distance_by_id,
+            "dom_match_by_id": dom_match_by_id,
+            "dom_distance_tol": dom_distance_tol,
             "status": "success"
         }
 
