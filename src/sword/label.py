@@ -16,7 +16,7 @@ from .structure import StructureEntry
 from .wyckoff import get_canonical_wyckoff_sets, mapping_by_sg
 
 
-def disorder_label(entry, *, site_tolerance: float = 0.0001, vac_tolerance: float = 1e-2, occ_tolerance: float = 1.0, frac_tolerance: float = 0.0001, verbose = False):
+def disorder_label(entry, *, site_tolerance: float = 0.0001, vac_tolerance: float = 1e-2, occ_tolerance: float = 1.0, frac_tolerance: float = 0.0001, include_positional_disorder: bool = True, verbose = False):
     """
     Accepts an ICSDEntry instance.
     Determining disorder types (vacancy, positional);
@@ -261,17 +261,15 @@ def disorder_label(entry, *, site_tolerance: float = 0.0001, vac_tolerance: floa
     )
     disorder_label = f"{wyckoff_set_std}_{space_group_number}_{element_seq}"
 
-    is_positional_disorder = False
+    is_positional_disorder = None
     intersect_orbs = []
     intersect_orb_error= None
-    if not is_occ_err:
+    if include_positional_disorder and not is_occ_err:
         try:
             is_positional_disorder, intersect_orbs = intersect_orb(entry, site_tolerance= site_tolerance, occ_tolerance= occ_tolerance)
         except Exception as e:
             is_positional_disorder = None
             intersect_orb_error = str(e)
-    else:
-        is_positional_disorder = None
 
     return {
         #disordered type:
@@ -321,7 +319,7 @@ def get_sword_label(
     symprec_scan_mode: str = "loose",
 ) -> str:
     if isinstance(data, Structure):
-        cif_txt = data.to(fmt="cif")
+        cif_txt = data
     elif isinstance(data, str):
         if os.path.isfile(data):
             with open(data, "r", encoding="utf-8") as f:
@@ -349,6 +347,7 @@ def get_sword_label(
         occ_tolerance=occ_tolerance,
         vac_tolerance=vac_tolerance,
         frac_tolerance=frac_tolerance,
+        include_positional_disorder=False,
         verbose=False,
     )["disorder_label"]
 
@@ -367,9 +366,10 @@ def get_sword_info(
     recover_cif_spg: bool = False,
     symprec_scan: bool = False,
     symprec_scan_mode: str = "loose",
+    include_positional_disorder: bool = True,
 ) -> str:
     if isinstance(data, Structure):
-        cif_txt = data.to(fmt="cif")
+        cif_txt = data
     elif isinstance(data, str):
         if os.path.isfile(data):
             with open(data, "r", encoding="utf-8") as f:
@@ -398,6 +398,7 @@ def get_sword_info(
         occ_tolerance=occ_tolerance,
         vac_tolerance=vac_tolerance,
         frac_tolerance=frac_tolerance,
+        include_positional_disorder=include_positional_disorder,
         verbose=False,
     )
     if getattr(entry, "symprec_scan", None) is not None:
@@ -426,6 +427,7 @@ def get_sword_label_for_ICSD(
         occ_tolerance=occ_tolerance,
         vac_tolerance=vac_tolerance,
         frac_tolerance=frac_tolerance,
+        include_positional_disorder=False,
         verbose=False,
     )["disorder_label"]
 
@@ -438,6 +440,7 @@ def get_sword_info_for_ICSD(
     vac_tolerance: float = 1e-2,
     frac_tolerance: float = 1e-4,
     meta=None,
+    include_positional_disorder: bool = True,
 ) -> str:
     entry = StructureEntry.from_collection_code(
         collection_code,
@@ -450,6 +453,7 @@ def get_sword_info_for_ICSD(
         occ_tolerance=occ_tolerance,
         vac_tolerance=vac_tolerance,
         frac_tolerance=frac_tolerance,
+        include_positional_disorder=include_positional_disorder,
         verbose=False,
     )
 

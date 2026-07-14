@@ -13,7 +13,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 _SYMPREC_SCAN_FACTORS = {
     "strict": (1 / 100, 1 / 75, 1 / 50),
     "loose": (1 / 100, 1 / 75, 1 / 50, 1 / 20, 1 / 15, 1 / 10, 1 / 8),
-    "recovery": (1 / 100, 1 / 75, 1 / 50, 1 / 20, 1 / 15, 1 / 10, 1 / 8, 1 / 5),
+    "recovery": (1 / 20, 1 / 15, 1 / 10, 1 / 8, 1 / 5),
 }
 
 
@@ -756,7 +756,19 @@ class StructureEntry:
     ):
         #construct a ICSD-style symmetrized CIF_txt from raw CIF or POSCAR
         scan_meta = None
-        if any(k in raw_txt for k in ("_atom_site", "_cell_length", "data_")):
+        if isinstance(raw_txt, Structure):
+            struct = raw_txt
+            raw_txt = ""
+            if symprec_scan:
+                symprec, scan_meta = select_symprec_by_scan(
+                    struct,
+                    symprec=symprec,
+                    angle_tolerance=angle_tolerance,
+                    mode=symprec_scan_mode,
+                )
+            sga = SpacegroupAnalyzer(struct, symprec=symprec, angle_tolerance=angle_tolerance)
+            is_merge = False
+        elif any(k in raw_txt for k in ("_atom_site", "_cell_length", "data_")):
             if recover_cif_spg:
                 try:
                     symprec, is_merge, struct, sga = find_symprec(raw_txt, n=2, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance)
@@ -793,7 +805,7 @@ class StructureEntry:
         sym_txt = str(_SymmetrizedCifWriter(raw_txt, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance, struct=struct, spg_analyzer=sga, conventional_struct=conventional_struct, refine_struct=refine_struct)._cf)
         # Check completeness of input to determine whether to parse raw or symmetrized file
         #use_sym = not is_symmetrized_CIF(raw_txt, sym_txt)
-        #chosed_txt = sym_txt if use_sym else raw_txt  
+        #chosed_txt = sym_txt if use_sym else raw_txt
         chosed_txt = sym_txt
         parser = CifParser(StringIO(chosed_txt))
         cif_dict = parser.as_dict()
