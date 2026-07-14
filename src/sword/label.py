@@ -316,6 +316,9 @@ def get_sword_label(
     frac_tolerance: float = 1e-4,
     conventional_struct: bool = True,
     refine_struct: bool = False,
+    recover_cif_spg: bool = False,
+    symprec_scan: bool = False,
+    symprec_scan_mode: str = "loose",
 ) -> str:
     if isinstance(data, Structure):
         cif_txt = data.to(fmt="cif")
@@ -335,6 +338,9 @@ def get_sword_label(
         parser_occ_tolerance=parser_occ_tolerance,
         conventional_struct=conventional_struct,
         refine_struct=refine_struct,
+        recover_cif_spg=recover_cif_spg,
+        symprec_scan=symprec_scan,
+        symprec_scan_mode=symprec_scan_mode,
     )
 
     return disorder_label(
@@ -358,6 +364,9 @@ def get_sword_info(
     frac_tolerance: float = 1e-4,
     conventional_struct: bool = True,
     refine_struct: bool = False,
+    recover_cif_spg: bool = False,
+    symprec_scan: bool = False,
+    symprec_scan_mode: str = "loose",
 ) -> str:
     if isinstance(data, Structure):
         cif_txt = data.to(fmt="cif")
@@ -378,9 +387,12 @@ def get_sword_info(
         parser_occ_tolerance=parser_occ_tolerance,
         conventional_struct=conventional_struct,
         refine_struct=refine_struct,
+        recover_cif_spg=recover_cif_spg,
+        symprec_scan=symprec_scan,
+        symprec_scan_mode=symprec_scan_mode,
     )
 
-    return entry, disorder_label(
+    info = disorder_label(
         entry,
         site_tolerance=site_tolerance,
         occ_tolerance=occ_tolerance,
@@ -388,6 +400,10 @@ def get_sword_info(
         frac_tolerance=frac_tolerance,
         verbose=False,
     )
+    if getattr(entry, "symprec_scan", None) is not None:
+        info["symprec_scan"] = entry.symprec_scan
+        info["symprec_scan"]["wyck_float_warn_count"] = len(info.get("wyck_float_warn") or [])
+    return entry, info
 
 def get_sword_label_for_ICSD(
     collection_code,

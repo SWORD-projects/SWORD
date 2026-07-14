@@ -10,6 +10,198 @@ from pymatgen.core.structure import Magmom, Structure
 from pymatgen.io.cif import CifBlock, CifFile, CifParser
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
+_SYMPREC_SCAN_FACTORS = {
+    "strict": (1 / 100, 1 / 75, 1 / 50),
+    "loose": (1 / 100, 1 / 75, 1 / 50, 1 / 20, 1 / 15, 1 / 10, 1 / 8),
+    "recovery": (1 / 100, 1 / 75, 1 / 50, 1 / 20, 1 / 15, 1 / 10, 1 / 8, 1 / 5),
+}
+
+
+def _recorded_space_group_number(cif_txt):
+    m = re.search(
+        r"_(?:space_group_IT_number|symmetry_Int_Tables_number)\s+['\"]?(\S+?)['\"]?(?:\s|$)",
+        cif_txt,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        return int(re.sub(r"\(.*\)", "", m.group(1)))
+    except Exception:
+        return None
+
+
+def _nearest_reasonable_neighbor_distance(structure, *, min_pair_distance=0.7, quantile=0.20):
+    nearest = []
+    for i in range(len(structure)):
+        ds = [
+            structure.get_distance(i, j)
+            for j in range(len(structure))
+            if i != j and structure.get_distance(i, j) >= min_pair_distance
+        ]
+        if ds:
+            nearest.append(min(ds))
+    if not nearest:
+        raise ValueError("Could not determine a reasonable nearest-neighbor distance.")
+    nearest = sorted(nearest)
+    idx = min(len(nearest) - 1, max(0, int(round((len(nearest) - 1) * quantile))))
+    return nearest[idx]
+
+
+def _symprec_scan_grid(d_ref, mode, anchor):
+    if mode not in _SYMPREC_SCAN_FACTORS:
+        raise ValueError("symprec_scan_mode must be one of 'strict', 'loose', or 'recovery'.")
+    values = [d_ref * factor for factor in _SYMPREC_SCAN_FACTORS[mode]]
+    if anchor is not None:
+        values.append(float(anchor))
+    return sorted({round(v, 12) for v in values if v > 0})
+
+
+def _wyckoff_signature(dataset):
+    counts = defaultdict(int)
+    for wyckoff, equiv in zip(dataset.wyckoffs, dataset.equivalent_atoms):
+        counts[(str(wyckoff), int(equiv))] += 1
+    return tuple(sorted((wyckoff, count) for (wyckoff, _), count in counts.items()))
+
+
+def _symmetry_candidate(structure, symprec, angle_tolerance):
+    try:
+        sga = SpacegroupAnalyzer(structure, symprec=symprec, angle_tolerance=angle_tolerance)
+        raw_sg = int(sga.get_space_group_number())
+        dataset = sga.get_symmetry_dataset()
+
+        conv_sg = None
+        prim_sg = None
+        conv_error = None
+        prim_error = None
+        try:
+            conv = sga.get_conventional_standard_structure()
+            conv_sg = int(
+                SpacegroupAnalyzer(conv, symprec=symprec, angle_tolerance=angle_tolerance)
+                .get_space_group_number()
+            )
+        except Exception as exc:
+            conv_error = repr(exc)
+
+        try:
+            prim = sga.get_primitive_standard_structure()
+            prim_sg = int(
+                SpacegroupAnalyzer(prim, symprec=symprec, angle_tolerance=angle_tolerance)
+                .get_space_group_number()
+            )
+        except Exception as exc:
+            prim_error = repr(exc)
+
+        if structure.is_ordered:
+            ok = raw_sg == conv_sg == prim_sg
+        else:
+            ok = True
+        signature = (raw_sg, _wyckoff_signature(dataset), ok)
+        return {
+            "symprec": symprec,
+            "tau": None,
+            "sg": raw_sg,
+            "conv_sg": conv_sg,
+            "prim_sg": prim_sg,
+            "conv_error": conv_error,
+            "prim_error": prim_error,
+            "ok": ok,
+            "signature": signature,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "symprec": symprec,
+            "tau": None,
+            "sg": None,
+            "conv_sg": None,
+            "prim_sg": None,
+            "ok": False,
+            "signature": None,
+            "error": repr(exc),
+        }
+
+
+def _merge_symmetry_plateaus(candidates):
+    plateaus = []
+    current = None
+    for cand in candidates:
+        if not cand["ok"]:
+            current = None
+            continue
+        key = cand["signature"]
+        if current is None or current["signature"] != key:
+            current = {
+                "signature": key,
+                "sg": cand["sg"],
+                "points": [cand],
+            }
+            plateaus.append(current)
+        else:
+            current["points"].append(cand)
+    return plateaus
+
+
+def _select_symmetry_plateau(plateaus, mode):
+    if not plateaus:
+        return None
+    stable = [p for p in plateaus if len(p["points"]) >= 2]
+    pool = plateaus if mode == "recovery" else (stable or plateaus)
+    if mode == "strict":
+        return min(pool, key=lambda p: p["points"][0]["symprec"])
+    return max(pool, key=lambda p: (p["points"][-1]["symprec"], len(p["points"])))
+
+
+def select_symprec_by_scan(structure, *, symprec=1e-2, angle_tolerance=5.0, mode="loose"):
+    d_ref = _nearest_reasonable_neighbor_distance(structure)
+    candidates = []
+    for sp in _symprec_scan_grid(d_ref, mode, symprec):
+        cand = _symmetry_candidate(structure, sp, angle_tolerance)
+        cand["tau"] = sp / d_ref
+        candidates.append(cand)
+
+    plateaus = _merge_symmetry_plateaus(candidates)
+    selected = _select_symmetry_plateau(plateaus, mode)
+    if selected is None:
+        return symprec, {
+            "enabled": True,
+            "mode": mode,
+            "d_ref": d_ref,
+            "selected_symprec": symprec,
+            "selected_sg": None,
+            "plateaus": [],
+            "warning": "no_self_consistent_plateau",
+        }
+
+    selected_point = selected["points"][-1] if mode != "strict" else selected["points"][0]
+    metadata = {
+        "enabled": True,
+        "mode": mode,
+        "d_ref": d_ref,
+        "selected_symprec": selected_point["symprec"],
+        "selected_tau": selected_point["tau"],
+        "selected_sg": selected["sg"],
+        "selected_conv_sg": selected_point["conv_sg"],
+        "selected_prim_sg": selected_point["prim_sg"],
+        "selected_cell_check": "enforced" if structure.is_ordered else "not_enforced_for_disordered",
+        "plateaus": [
+            {
+                "sg": p["sg"],
+                "n_points": len(p["points"]),
+                "symprec_min": p["points"][0]["symprec"],
+                "symprec_max": p["points"][-1]["symprec"],
+            }
+            for p in plateaus
+        ],
+    }
+    if selected_point["tau"] >= 0.2 - 1e-8:
+        metadata["warning"] = "very_loose_candidate"
+    elif selected_point["tau"] >= 0.1 - 1e-8:
+        metadata["warning"] = "loose_candidate"
+    else:
+        metadata["warning"] = None
+    return selected_point["symprec"], metadata
+
 
 class _SymmetrizedCifWriter:
     """A customized Pymatgen CIFwrapper to write symmetrized CIF files with wyckoff letter from CIF raw txt."""
@@ -546,19 +738,56 @@ class StructureEntry:
         self.df = pd.DataFrame(self.records)
 
     @classmethod
-    def from_txt(cls, raw_txt, *, code = None, meta=None, symprec=1e-2, angle_tolerance=5, parser_occ_tolerance: float = 1.05, source: str = 'None', conventional_struct: bool = True, refine_struct: bool = False):
+    def from_txt(
+        cls,
+        raw_txt,
+        *,
+        code=None,
+        meta=None,
+        symprec=1e-2,
+        angle_tolerance=5,
+        parser_occ_tolerance: float = 1.05,
+        source: str = 'None',
+        conventional_struct: bool = True,
+        refine_struct: bool = False,
+        recover_cif_spg: bool = False,
+        symprec_scan: bool = False,
+        symprec_scan_mode: str = "loose",
+    ):
         #construct a ICSD-style symmetrized CIF_txt from raw CIF or POSCAR
+        scan_meta = None
         if any(k in raw_txt for k in ("_atom_site", "_cell_length", "data_")):
-            try:
-                symprec, is_merge, struct, sga = find_symprec(raw_txt, n=2, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance)
-            except Exception as e:
-                warnings.warn(
-                    f"[StructureEntry.from_txt] find_symprec failed: falling back to use default symprec."
-                    f"symprec={symprec}, angle_tol={angle_tolerance}. "
-                    f"Error: {e}")
-                symprec, is_merge, struct, sga = symprec, False, None, None
+            if recover_cif_spg:
+                try:
+                    symprec, is_merge, struct, sga = find_symprec(raw_txt, n=2, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance)
+                except Exception as e:
+                    warnings.warn(
+                        f"[StructureEntry.from_txt] find_symprec failed: falling back to use default symprec."
+                        f"symprec={symprec}, angle_tol={angle_tolerance}. "
+                        f"Error: {e}")
+                    symprec, is_merge, struct, sga = symprec, False, None, None
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    struct = CifParser(StringIO(raw_txt), occupancy_tolerance=parser_occ_tolerance).parse_structures(primitive=False)[0]
+                if symprec_scan:
+                    symprec, scan_meta = select_symprec_by_scan(
+                        struct,
+                        symprec=symprec,
+                        angle_tolerance=angle_tolerance,
+                        mode=symprec_scan_mode,
+                    )
+                sga = SpacegroupAnalyzer(struct, symprec=symprec, angle_tolerance=angle_tolerance)
+                is_merge = False
         else:
             struct = Structure.from_str(raw_txt, fmt="poscar")
+            if symprec_scan:
+                symprec, scan_meta = select_symprec_by_scan(
+                    struct,
+                    symprec=symprec,
+                    angle_tolerance=angle_tolerance,
+                    mode=symprec_scan_mode,
+                )
             sga = SpacegroupAnalyzer(struct, symprec=symprec, angle_tolerance=angle_tolerance)
             is_merge = False
         sym_txt = str(_SymmetrizedCifWriter(raw_txt, symprec=symprec, angle_tolerance=angle_tolerance, parser_occ_tolerance=parser_occ_tolerance, struct=struct, spg_analyzer=sga, conventional_struct=conventional_struct, refine_struct=refine_struct)._cf)
@@ -579,7 +808,16 @@ class StructureEntry:
         #entry.read_by = "pmg" if use_sym else "raw"
         entry.read_by = "pmg"
         entry.source = source
+        entry.symprec = symprec
+        entry.symprec_scan = scan_meta
         entry._apply_payload(payload, meta)
+        recorded_sg = _recorded_space_group_number(raw_txt)
+        if recorded_sg is not None and recorded_sg != 1 and recorded_sg != entry.spg_num:
+            warnings.warn(
+                f"SWORD space group ({entry.spg_num}) is inconsistent with the CIF-recorded "
+                f"space group ({recorded_sg}). CIF-recorded P1 is ignored silently; "
+                "non-P1 mismatches should be checked."
+            )
         return entry
 
     @classmethod
