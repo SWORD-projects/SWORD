@@ -28,6 +28,7 @@ from .label import (
 from .structure import StructureEntry, symm_orbits_df
 from .utils import (
     dedupe_by_dom_projection,
+    dedupe_by_vector_dom,
     dedupe_by_same_dom,
     filter_by_elements_and_sg,
     find_by_disorder_label,
@@ -43,6 +44,7 @@ __all__ = [
     "SWORDFamilyMatcher",
     "compute_disorder",
     "dedupe_by_dom_projection",
+    "dedupe_by_vector_dom",
     "dedupe_by_same_dom",
     "disorder_label",
     "filter_by_elements_and_sg",

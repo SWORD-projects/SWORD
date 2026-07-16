@@ -68,6 +68,36 @@ def get_equiv_positions(point, sym_ops, frac_tolerance=1e-4):
                        
     return tuple(sorted(final_coords))
 
+
+def _make_occ_vector(merged_occ):
+    """Return the normalized, element-keyed occupancy-polarization vector."""
+    by_element = defaultdict(float)
+    for token, occ in (merged_occ or {}).items():
+        token = str(token)
+        if token.upper() == "VAC":
+            element = "VAC"
+        else:
+            match = re.match(r"[A-Z][a-z]?", token)
+            element = match.group(0) if match else token
+        by_element[element] += float(occ)
+
+    by_element = {
+        element: occ
+        for element, occ in by_element.items()
+        if occ > 0
+    }
+    total = sum(by_element.values())
+    n_components = len(by_element)
+    if total <= 0 or n_components < 2:
+        return None
+
+    uniform_occ = 1.0 / n_components
+    scale = math.sqrt(n_components / (n_components - 1))
+    return {
+        element: round(scale * (occ / total - uniform_occ), 12)
+        for element, occ in sorted(by_element.items())
+    }
+
 def compute_disorder(entry, disordered_list, total_sites = 0, verbose = False, return_details: bool = False):
     """
     For disorder structures, quantifies the degree of mixing(DOM) in a structure. The function utilizes 
@@ -140,6 +170,7 @@ def compute_disorder(entry, disordered_list, total_sites = 0, verbose = False, r
         dom_info = {
             "representative_site_labels": rep_site_labels,
             "representative_site_merged_occ": rep_merge_occ,
+            "representative_site_occ_vector": _make_occ_vector(rep_merge_occ),
             "delta_pair_used": [a, b],
             "delta_occ_used": [XA, XZ],
             "delta_sign": delta,

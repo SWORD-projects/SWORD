@@ -15,7 +15,7 @@ from pymatgen.io.cif import CifParser
 
 from .family import SWORDFamilyMatcher
 from .label import get_sword_info, get_sword_info_for_ICSD
-from .utils import dedupe_by_dom_projection, group_ICSD
+from .utils import dedupe_by_dom_projection, dedupe_by_vector_dom, group_ICSD
 
 
 _ANOMALY_KEYS = (
@@ -207,7 +207,7 @@ def _add_anomaly_rows(anomalies, key, records, *, id_col, entry_id):
 
 def _dom_summary(dom_info):
     if not dom_info:
-        return None, None, None
+        return None, None, None, None
 
     merged_occ = dom_info.get("representative_site_merged_occ") or {}
     by_element = {}
@@ -216,13 +216,14 @@ def _dom_summary(dom_info):
         by_element[element] = by_element.get(element, 0.0) + float(occ)
 
     if not by_element:
-        return None, None, None
+        return None, None, None, None
 
     items = sorted(by_element.items())
     elements = [element for element, _ in items]
     occupancies = [round(occ, 6) for _, occ in items]
     dominant_element = max(items, key=lambda item: (item[1], item[0]))[0]
-    return elements, occupancies, dominant_element
+    occ_vector = dom_info.get("representative_site_occ_vector")
+    return elements, occupancies, dominant_element, occ_vector
 
 
 def _empty_label_columns():
@@ -237,6 +238,7 @@ def _empty_label_columns():
         "dom_site_elements": None,
         "dom_site_occupancies": None,
         "dom_dominant_element": None,
+        "dom_site_occ_vector": None,
     }
 
 
@@ -290,7 +292,7 @@ def _label_dataframe_impl(
                 params = _filter_kwargs(get_sword_info, sword_params)
                 _, info = get_sword_info(row[cif_col], **params)
 
-            dom_elements, dom_occs, dom_dominant = _dom_summary(info.get("dom_info"))
+            dom_elements, dom_occs, dom_dominant, dom_occ_vector = _dom_summary(info.get("dom_info"))
             out.update(
                 {
                     "SWORD_label": info.get("disorder_label"),
@@ -302,6 +304,7 @@ def _label_dataframe_impl(
                     "dom_site_elements": dom_elements,
                     "dom_site_occupancies": dom_occs,
                     "dom_dominant_element": dom_dominant,
+                    "dom_site_occ_vector": dom_occ_vector,
                 }
             )
 
@@ -475,7 +478,10 @@ def _build_refined_results(
     label_results,
     *,
     id_col,
+    disorder_refinement_policy,
     dom_distance_tol,
+    composition_tol,
+    dom_tol,
     drop_hard_errors=True,
     drop_positional_disorder=True,
     drop_occupancy_orbit_error=True,
@@ -483,6 +489,11 @@ def _build_refined_results(
     drop_equivalent_sites_warning=True,
     drop_same_valence_site_warning=False,
 ):
+    if disorder_refinement_policy not in {"dom_project", "dom_vector"}:
+        raise ValueError(
+            "disorder_refinement_policy must be 'dom_project' or 'dom_vector'."
+        )
+
     df = label_results.dropna(subset=["SWORD_label"]).copy()
     if df.empty:
         return df
@@ -516,8 +527,8 @@ def _build_refined_results(
             keep_ids.append(ordered.sort_values(id_col).iloc[0][id_col])
 
         if not disorder.empty:
-            keep_ids.extend(
-                dedupe_by_dom_projection(
+            if disorder_refinement_policy == "dom_project":
+                disorder_keep_ids = dedupe_by_dom_projection(
                     disorder,
                     id_col=id_col,
                     dom_col="degree_of_mixing",
@@ -526,7 +537,16 @@ def _build_refined_results(
                     dominant_element_col="dom_dominant_element",
                     tol=dom_distance_tol,
                 )
-            )
+            else:
+                disorder_keep_ids = dedupe_by_vector_dom(
+                    disorder,
+                    id_col=id_col,
+                    dom_col="degree_of_mixing",
+                    vector_col="dom_site_occ_vector",
+                    composition_tol=composition_tol,
+                    dom_tol=dom_tol,
+                )
+            keep_ids.extend(disorder_keep_ids)
 
     return df[df[id_col].isin(keep_ids)].copy()
 
@@ -591,7 +611,10 @@ def run_icsd_dedup_pipeline(
     family_info=False,
     family_params=None,
     output_dir=None,
+    disorder_refinement_policy="dom_vector",
     dom_distance_tol=0.03,
+    composition_tol=0.05,
+    dom_tol=0.03,
     drop_hard_errors=True,
     drop_positional_disorder=True,
     drop_occupancy_orbit_error=True,
@@ -622,8 +645,11 @@ def run_icsd_dedup_pipeline(
             ``label_results`` using ``SWORDFamilyMatcher``.
         family_params: Optional dictionary passed to ``SWORDFamilyMatcher``.
         output_dir: If provided, save all standard outputs to this directory.
-        dom_distance_tol: Distance tolerance used by DOM-projection
-            deduplication in ``(dominant occupancy, DOM)`` space.
+        disorder_refinement_policy: Disorder deduplication policy. Use
+            ``'dom_vector'`` (default) or the legacy ``'dom_project'``.
+        dom_distance_tol: Distance tolerance used by ``'dom_project'``.
+        composition_tol: Occupancy-vector tolerance used by ``'dom_vector'``.
+        dom_tol: Absolute-DOM tolerance used by ``'dom_vector'``.
         drop_hard_errors: Remove structure parse and label generation failures.
         drop_positional_disorder: Remove positional-disorder entries and
             positional-check failures.
@@ -668,7 +694,10 @@ def run_icsd_dedup_pipeline(
     refined = _build_refined_results(
         label_results,
         id_col=id_col,
+        disorder_refinement_policy=disorder_refinement_policy,
         dom_distance_tol=dom_distance_tol,
+        composition_tol=composition_tol,
+        dom_tol=dom_tol,
         **curation_filters,
     )
 
@@ -686,7 +715,10 @@ def run_icsd_dedup_pipeline(
             "sword_params": dict(sword_params or {}),
             "family_info": family_info,
             "family_params": dict(family_params or {}),
+            "disorder_refinement_policy": disorder_refinement_policy,
             "dom_distance_tol": dom_distance_tol,
+            "composition_tol": composition_tol,
+            "dom_tol": dom_tol,
             "curation_filters": curation_filters,
         },
     )

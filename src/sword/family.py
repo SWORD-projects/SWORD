@@ -16,7 +16,9 @@ from pymatgen.core.periodic_table import DummySpecie
 from pymatgen.io.cif import CifParser
 from pymatgen.symmetry.groups import SpaceGroup
 
+from .disorder import _make_occ_vector
 from .label import get_sword_label
+from .utils import vector_dom_distance
 from .vacancy import find_vacancy_ordered
 
 if TYPE_CHECKING:
@@ -156,6 +158,7 @@ class SWORDFamilyMatcher(MSONable):
             "dom_site_elements": [element for element, _ in items],
             "dom_site_occupancies": [round(occ, 6) for _, occ in items],
             "dom_dominant_element": max(items, key=lambda item: (item[1], item[0]))[0],
+            "dom_site_occ_vector": _make_occ_vector(occ_by_element),
             "degree_of_mixing": round(delta * site_mixing, 4),
             "dom_source": "family_matcher",
         }
@@ -463,9 +466,24 @@ class SWORDFamilyMatcher(MSONable):
         ref_family_col: str = "SWORD_family_dic",
         query_family_cols: tuple[str, ...] = ("SWORD_family_dic", "SWORD_family_dic_vac"),
         id_col: str | None = None,
-        dom_distance_tol: float = 0.10,
+        disorder_refinement_policy: str = "dom_vector",
+        dom_distance_tol: float | None = 0.30,
+        composition_tol: float = 0.30,
+        dom_tol: float = 0.30,
     ) -> dict[str, Any]:
-        """Match one query structure or query row against a reference table."""
+        """Match one query structure or query row against a reference table.
+
+        Direct disorder matches use the occupancy-vector policy by default.
+        ``dom_distance_tol`` applies only to the legacy ``dom_project`` policy.
+        """
+        if disorder_refinement_policy not in {"dom_project", "dom_vector"}:
+            raise ValueError(
+                "disorder_refinement_policy must be 'dom_project' or 'dom_vector'."
+            )
+        if dom_distance_tol is not None and dom_distance_tol < 0:
+            raise ValueError("dom_distance_tol must be non-negative or None.")
+        if composition_tol <= 0 or dom_tol <= 0:
+            raise ValueError("composition_tol and dom_tol must be positive.")
         all_query_dicts = self._query_family_dicts(query, query_family_cols)
         query_dicts = [
             (source, family_dic)
@@ -536,6 +554,7 @@ class SWORDFamilyMatcher(MSONable):
                 "dom_site_elements",
                 "dom_site_occupancies",
                 "dom_dominant_element",
+                "dom_site_occ_vector",
             )
         }
 
@@ -586,21 +605,39 @@ class SWORDFamilyMatcher(MSONable):
                     sg_relation_by_id[ref_id] = self._sg_relation(query_child_labels[0], ref_child_label)
                     dom_distance = None
                     if matching_mode == "direct" and "+" in ref_child_label:
-                        dom_distance = self._dom_distance(
-                            query_parent_info.get(ref_child_label),
-                            ref_elements=ref_dom_columns["dom_site_elements"][idx],
-                            ref_occupancies=ref_dom_columns["dom_site_occupancies"][idx],
-                            ref_dominant_element=ref_dom_columns["dom_dominant_element"][idx],
-                            ref_degree_of_mixing=ref_dom_columns["degree_of_mixing"][idx],
-                        )
+                        query_info = query_parent_info.get(ref_child_label)
+                        if disorder_refinement_policy == "dom_project":
+                            dom_distance = self._dom_distance(
+                                query_info,
+                                ref_elements=ref_dom_columns["dom_site_elements"][idx],
+                                ref_occupancies=ref_dom_columns["dom_site_occupancies"][idx],
+                                ref_dominant_element=ref_dom_columns["dom_dominant_element"][idx],
+                                ref_degree_of_mixing=ref_dom_columns["degree_of_mixing"][idx],
+                            )
+                        elif query_info:
+                            dom_distance = vector_dom_distance(
+                                query_info.get("dom_site_occ_vector"),
+                                query_info.get("degree_of_mixing"),
+                                ref_dom_columns["dom_site_occ_vector"][idx],
+                                ref_dom_columns["degree_of_mixing"][idx],
+                                composition_tol=composition_tol,
+                                dom_tol=dom_tol,
+                            )
+                            if dom_distance is not None:
+                                dom_distance = round(dom_distance, 6)
                     dom_distance_by_id[ref_id] = dom_distance
-                    dom_match_by_id[ref_id] = (
-                        "within_tol"
-                        if dom_distance is not None and dom_distance <= dom_distance_tol
-                        else "outside_tol"
-                        if dom_distance is not None
-                        else "not_comparable"
-                    )
+                    if dom_distance is None:
+                        dom_match_by_id[ref_id] = "not_comparable"
+                    elif disorder_refinement_policy == "dom_vector":
+                        dom_match_by_id[ref_id] = (
+                            "within_tol" if dom_distance <= 1.0 else "outside_tol"
+                        )
+                    elif dom_distance_tol is None:
+                        dom_match_by_id[ref_id] = "not_thresholded"
+                    elif dom_distance <= dom_distance_tol:
+                        dom_match_by_id[ref_id] = "within_tol"
+                    else:
+                        dom_match_by_id[ref_id] = "outside_tol"
 
         return {
             "child_label": query_child_labels[0],

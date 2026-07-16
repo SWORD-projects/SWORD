@@ -1,3 +1,4 @@
+import math
 import re
 
 import pandas as pd
@@ -207,4 +208,89 @@ def dedupe_by_dom_projection(
                 }
             )
 
+    return keep_codes
+
+
+def _as_occ_vector(vector):
+    if not isinstance(vector, dict) or len(vector) < 2:
+        return None
+    try:
+        vector = {str(key): float(value) for key, value in vector.items()}
+    except (TypeError, ValueError):
+        return None
+    return vector if all(math.isfinite(value) for value in vector.values()) else None
+
+
+def vector_dom_distance(vector_a, dom_a, vector_b, dom_b, *, composition_tol=0.05, dom_tol=0.03):
+    """Return the normalized joint occupancy-vector/DOM distance."""
+    if composition_tol <= 0 or dom_tol <= 0:
+        raise ValueError("composition_tol and dom_tol must be positive.")
+    vector_a = _as_occ_vector(vector_a)
+    vector_b = _as_occ_vector(vector_b)
+    if vector_a is None or vector_b is None or set(vector_a) != set(vector_b):
+        return None
+    try:
+        dom_a, dom_b = float(dom_a), float(dom_b)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(dom_a) or not math.isfinite(dom_b):
+        return None
+
+    n_components = len(vector_a)
+    vector_distance = math.sqrt(sum(
+        (vector_a[element] - vector_b[element]) ** 2 for element in vector_a
+    ))
+    composition_distance = vector_distance / math.sqrt(2 * n_components / (n_components - 1))
+    dom_distance = abs(abs(dom_a) - abs(dom_b))
+    return math.hypot(composition_distance / composition_tol, dom_distance / dom_tol)
+
+
+def dedupe_by_vector_dom(
+    group_df,
+    *,
+    id_col="CollectionCode",
+    dom_col="degree_of_mixing",
+    vector_col="dom_site_occ_vector",
+    composition_tol=0.05,
+    dom_tol=0.03,
+):
+    """Deduplicate one SWORD group by occupancy-vector and absolute-DOM distance."""
+    if group_df is None or len(group_df) == 0:
+        return []
+    if composition_tol <= 0 or dom_tol <= 0:
+        raise ValueError("composition_tol and dom_tol must be positive.")
+
+    df = group_df.dropna(subset=[id_col]).copy()
+    if vector_col not in df or dom_col not in df:
+        return df[id_col].tolist()
+    df["_occ_vector"] = df[vector_col].apply(_as_occ_vector)
+    df["_DOM"] = pd.to_numeric(df[dom_col], errors="coerce")
+    comparable = df["_occ_vector"].notna() & df["_DOM"].apply(math.isfinite)
+    incomparable_ids = df.loc[~comparable, id_col].tolist()
+    df = df.loc[comparable].copy()
+    df["_radius"] = df["_occ_vector"].apply(
+        lambda vector: math.sqrt(sum(value ** 2 for value in vector.values()))
+    )
+    df["_abs_DOM"] = df["_DOM"].abs()
+
+    keep_codes, representatives = [], []
+    for _, row in df.sort_values(
+        ["_radius", "_abs_DOM", id_col], ascending=[True, False, True]
+    ).iterrows():
+        matched = False
+        for representative in representatives:
+            distance = vector_dom_distance(
+                row["_occ_vector"], row["_DOM"],
+                representative["_occ_vector"], representative["_DOM"],
+                composition_tol=composition_tol,
+                dom_tol=dom_tol,
+            )
+            if distance is not None and distance <= 1.0:
+                matched = True
+                break
+        if not matched:
+            keep_codes.append(row[id_col])
+            representatives.append(row)
+
+    keep_codes.extend(sorted(incomparable_ids))
     return keep_codes
