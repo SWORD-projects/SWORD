@@ -1,7 +1,7 @@
 
 """SWORDlib is a Python library based on SWORD - Symmetry and Wyckoff-sequence of Ordered and Disordered crystals."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __email__ = "YUYAO003@e.ntu.edu.sg"
 
 from .disorder import (
