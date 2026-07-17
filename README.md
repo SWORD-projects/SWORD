@@ -57,6 +57,8 @@ The main labelling parameters are:
   pymatgen/spglib documentation for detailed behavior.
 - `angle_tolerance`: angular tolerance, in degrees, used during symmetry
   standardization. See pymatgen documentation for details.
+- `symprec_scan`: optional adaptive symmetry-tolerance scan. It is disabled by
+  default (`False`); when enabled, the default `symprec_scan_mode` is `"loose"`.
 - `site_tolerance`: distance tolerance for deciding whether two sites should be
   treated as the same disorder site.
 - `occ_tolerance`: SWORD's post-parsing occupancy tolerance for each grouped
@@ -110,7 +112,9 @@ result = run_icsd_dedup_pipeline(
         "frac_tolerance": 1e-4,
     },
     family_info=False,
-    dom_distance_tol=0.03,
+    disorder_refinement_policy="dom_vector",
+    composition_tol=0.05,
+    dom_tol=0.03,
     output_dir="sword_icsd_results",
 )
 ```
@@ -122,6 +126,11 @@ The result object contains:
 - `result.anomalies`: detailed warning/error tables.
 - `result.label_groups`: grouped SWORD-label summary table.
 - `result.refined`: curated and deduplicated entries.
+
+Disordered entries use the `dom_vector` refinement policy by default. Its
+default tolerances are `composition_tol=0.05` and `dom_tol=0.03`; smaller values
+make refinement stricter. The representative-site occupancy vector used by the
+policy is available in `result.label_results["dom_site_occ_vector"]`.
 
 `result.prescreen_rejected["reject_reason"]` records why a row did not enter
 the labelling stage. Possible reasons include:
@@ -271,7 +280,13 @@ reference_df["SWORD_family_dic"] = reference_df["cif"].apply(
 Then compare a query against the reference table:
 
 ```python
-matches = matcher.fit_many(query_structure, reference_df)
+matches = matcher.fit_many(
+    query_structure,
+    reference_df,
+    disorder_refinement_policy="dom_vector",
+    composition_tol=0.30,
+    dom_tol=0.30,
+)
 
 print(matches["matched_disordered_ids"])
 print(matches["matched_disordered_labels"])
@@ -281,6 +296,12 @@ By default, `fit_many` reads `reference_df["SWORD_family_dic"]`. If the query is
 a dataframe row with `SWORD_family_dic` and `SWORD_family_dic_vac`, both query
 columns are used and `matches["matched_source_by_id"]` records which query
 column produced each match.
+
+For comparable direct disorder matches, `fit_many` also returns
+`dom_distance_by_id` and `dom_match_by_id`, together with `matching_mode_by_id`
+and `sg_relation_by_id` for concise match diagnostics. `fit_many` uses the
+`dom_vector` policy by default with `composition_tol=0.30` and `dom_tol=0.30`.
+Use smaller tolerances when a stricter parent-composition match is required.
 
 `fill_vacancy=True` can be useful when ordered structures may represent vacancy
 ordering variants. In practice, this is most useful for query structures that
